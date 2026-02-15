@@ -85,7 +85,12 @@ def load_full_data(
         df = pd.read_parquet(full_path, columns=columns)
     except Exception:
         df = pd.read_parquet(full_path, columns=[era_col, target_col] + features)
-        if id_col and id_col not in df.columns:
+    if id_col and id_col not in df.columns:
+        # Some parquet builds store id as index metadata instead of a physical
+        # column; normalize to an explicit column for downstream joins.
+        if getattr(df.index, "name", None) == id_col:
+            df = df.reset_index()
+        else:
             df[id_col] = df.index
     return df
 
