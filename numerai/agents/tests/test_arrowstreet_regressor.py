@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import unittest
+import warnings
 
 try:
     import numpy as np
@@ -17,6 +18,7 @@ except Exception:  # pragma: no cover
 
 
 HAS_SKLEARN = importlib.util.find_spec("sklearn") is not None
+HAS_LIGHTGBM = importlib.util.find_spec("lightgbm") is not None
 HAS_PANDAS_NUMPY = np is not None and pd is not None
 HAS_MODEL = ArrowstreetRegressor is not None
 
@@ -85,3 +87,33 @@ class TestArrowstreetRegressor(unittest.TestCase):
         p1 = m1.predict(X)
         p2 = m2.predict(X)
         self.assertTrue(np.allclose(p1, p2))
+
+    @unittest.skipUnless(HAS_LIGHTGBM, "lightgbm is required for stage2 lgbm test.")
+    def test_two_stage_lgbm_predict_has_no_feature_name_warning(self) -> None:
+        X, y = self._make_data()
+        model = ArrowstreetRegressor(
+            feature_cols=["feature_a", "feature_b", "feature_c"],
+            basket_cluster_sizes=[4],
+            linkage_k=3,
+            random_state=7,
+            model_variant="residual_two_stage",
+            stage2_model_type="lgbm",
+            stage2_lgbm_params={
+                "n_estimators": 25,
+                "learning_rate": 0.1,
+                "num_leaves": 16,
+                "verbosity": -1,
+                "n_jobs": 1,
+                "random_state": 7,
+            },
+        )
+        model.fit(X, y)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            preds = model.predict(X)
+        self.assertEqual(preds.shape[0], X.shape[0])
+        messages = [str(item.message) for item in caught]
+        self.assertFalse(
+            any("X does not have valid feature names" in msg for msg in messages),
+            "stage2 LightGBM predict emitted feature-name warnings",
+        )

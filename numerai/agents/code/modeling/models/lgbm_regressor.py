@@ -56,3 +56,16 @@ class LGBMRegressor:
 
     def __getattr__(self, name: str):
         return getattr(self._model, name)
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        # Modules are not pickleable; restore this handle in __setstate__.
+        state["_lgb"] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        if self.__dict__.get("_lgb") is None:
+            import lightgbm as lgb
+
+            self._lgb = lgb

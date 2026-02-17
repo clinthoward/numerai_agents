@@ -45,6 +45,8 @@ class ArrowstreetRegressor:
         basket_cluster_sizes: list[int] | None = None,
         linkage_k: int = 10,
         linkage_stats: list[str] | None = None,
+        use_baskets: bool = True,
+        use_linkages: bool = True,
         model_variant: str = "standard",
         stage2_model_type: str = "ridge",
         stage2_lgbm_params: dict[str, Any] | None = None,
@@ -60,6 +62,8 @@ class ArrowstreetRegressor:
         self._basket_cluster_sizes = basket_cluster_sizes or [16]
         self._linkage_k = int(linkage_k)
         self._linkage_stats = linkage_stats or ["mean", "std", "min", "max"]
+        self._use_baskets = bool(use_baskets)
+        self._use_linkages = bool(use_linkages)
         self._model_variant = model_variant
         self._stage2_model_type = stage2_model_type
         self._stage2_lgbm_params = stage2_lgbm_params or {}
@@ -91,7 +95,8 @@ class ArrowstreetRegressor:
             random_state=self._random_state,
             dtype_float=self._dtype_float,
         )
-        basket_builder.fit(X_df[[self._era_col, *base_features]])
+        # X_df already contains era + feature columns for this model path.
+        basket_builder.fit(X_df)
         linkage_builder = LinkageBuilder(
             k=self._linkage_k,
             stats=list(self._linkage_stats),
@@ -110,6 +115,10 @@ class ArrowstreetRegressor:
         self._linkage_feature_names = linkage_feature_names
 
         if self._model_variant == "residual_two_stage":
+            if not self._use_linkages:
+                raise ValueError(
+                    "ArrowstreetRegressor model_variant='residual_two_stage' requires use_linkages=True."
+                )
             self._model = self._fit_two_stage(X_df, y_series)
         else:
             self._model = self._fit_standard(
@@ -295,7 +304,15 @@ class ArrowstreetRegressor:
         return model
 
     def _predict_model(self, model, X_block: np.ndarray) -> np.ndarray:  # noqa: ANN001
-        preds = model.predict(X_block)
+        X_for_predict: np.ndarray | pd.DataFrame = X_block
+        feature_names = getattr(model, "feature_names_in_", None)
+        if (
+            feature_names is not None
+            and X_block.ndim == 2
+            and len(feature_names) == X_block.shape[1]
+        ):
+            X_for_predict = pd.DataFrame(X_block, columns=list(feature_names))
+        preds = model.predict(X_for_predict)
         return np.asarray(preds, dtype=np.dtype(self._dtype_float)).ravel()
 
     def _build_feature_block(
@@ -366,10 +383,14 @@ class ArrowstreetRegressor:
         basket_builder: BasketBuilder,
         indirect_base: list[str],
     ) -> list[str]:
+        if not self._use_baskets:
+            return []
         basket_cols = [f"basket_{name}" for name in basket_builder.clusterers.keys()]
         return [f"{basket}__{col}" for basket in basket_cols for col in indirect_base]
 
     def _build_linkage_feature_names(self, indirect_base: list[str]) -> list[str]:
+        if not self._use_linkages:
+            return []
         return [f"lnk_{stat}_{col}" for stat in self._linkage_stats for col in indirect_base]
 
     def _validate_feature_inputs(self, X_df: pd.DataFrame) -> None:
@@ -392,14 +413,15 @@ class ArrowstreetRegressor:
             raise ValueError(
                 f"ArrowstreetRegressor requires era column '{self._era_col}' in X."
             )
-        return X.copy()
+        # Avoid full-frame copies; full-data CV folds can be multiple GB.
+        return X
 
     @staticmethod
     def _coerce_y(y, index: pd.Index) -> pd.Series:  # noqa: ANN001
         if isinstance(y, pd.Series):
             if not y.index.equals(index):
                 y = y.reindex(index)
-            return y.astype("float32")
+            return y.astype("float32", copy=False)
         values = np.asarray(y, dtype=np.float32).ravel()
         if values.shape[0] != index.shape[0]:
             raise ValueError("y must have the same number of rows as X.")

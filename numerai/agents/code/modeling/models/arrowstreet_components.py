@@ -183,6 +183,8 @@ class BasketBuilder:
             )
             model.fit(self._emb_train.values)
             self.clusterers[f"bkt{k}"] = model
+        # Release temporary training embeddings once clusterers are fitted.
+        self._emb_train = None
         if not self.clusterers:
             raise ValueError("No valid basket clusterers created. Check cluster_sizes.")
 
