@@ -36,6 +36,44 @@ DEFAULT_OUTPUT_DIR = AGENTS_DIR / "experiments" / "arrowstreet_integration" / "v
 DEFAULT_ARTIFACTS_ROOT = AGENTS_DIR / "signals_artifacts"
 REPO_ROOT = NUMERAI_DIR.parent
 
+_LEGACY_LGBM_MODEL_KEYS = {
+    "n_estimators",
+    "learning_rate",
+    "max_depth",
+    "num_leaves",
+    "colsample_bytree",
+    "subsample",
+    "min_data_in_leaf",
+    "n_jobs",
+    "verbosity",
+    "device_type",
+}
+_ARROWSTREET_MODEL_KEYS = {
+    "ridge_alpha",
+    "indirect_max_base_features",
+    "basket_cluster_sizes",
+    "linkage_k",
+    "linkage_stats",
+    "use_baskets",
+    "use_linkages",
+    "model_variant",
+    "stage2_model_type",
+    "stage2_lgbm_params",
+    "stage2_weight",
+    "stage2_target_mode",
+    "stage2_benchmark_col",
+    "stage2_benchmark_beta",
+    "dtype_float",
+    "random_state",
+    "era_col",
+    "group_sets",
+    "indirect_feature_selection",
+    "indirect_feature_ranking_target",
+    "indirect_feature_ranking_min_eras",
+    "embedding_mode",
+    "embedding_pca_components",
+}
+
 
 @dataclass(frozen=True)
 class SignalsRunSettings:
@@ -299,6 +337,17 @@ def _build_model(
     params.setdefault("use_linkages", variant.toggles.use_linkages)
     if not variant.toggles.use_linkages:
         params["linkage_stats"] = []
+
+    unknown = sorted(set(params.keys()) - _ARROWSTREET_MODEL_KEYS)
+    legacy = [key for key in unknown if key in _LEGACY_LGBM_MODEL_KEYS]
+    for key in legacy:
+        params.pop(key, None)
+    remaining_unknown = sorted(set(params.keys()) - _ARROWSTREET_MODEL_KEYS)
+    if remaining_unknown:
+        raise ValueError(
+            "Unsupported Arrowstreet parameters in variant model_params: "
+            + ", ".join(remaining_unknown)
+        )
 
     return ArrowstreetRegressor(feature_cols=feature_cols, **params)
 

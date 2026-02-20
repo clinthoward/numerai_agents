@@ -28,7 +28,12 @@ HAS_MODEL = ArrowstreetRegressor is not None
     "scikit-learn, numpy, pandas and model imports are required for ArrowstreetRegressor tests.",
 )
 class TestArrowstreetRegressor(unittest.TestCase):
-    def _make_data(self, n_eras: int = 10, rows_per_era: int = 20):
+    def _make_data(
+        self,
+        n_eras: int = 10,
+        rows_per_era: int = 20,
+        include_benchmark: bool = False,
+    ):
         rng = np.random.default_rng(123)
         eras = np.repeat([f"{i:04d}" for i in range(1, n_eras + 1)], rows_per_era)
         f1 = rng.normal(size=eras.shape[0])
@@ -43,6 +48,10 @@ class TestArrowstreetRegressor(unittest.TestCase):
                 "feature_c": f3.astype(np.float32),
             }
         )
+        if include_benchmark:
+            X["v52_lgbm_ender20"] = (
+                0.4 * f1 - 0.1 * f2 + rng.normal(scale=0.1, size=eras.shape[0])
+            ).astype(np.float32)
         y = pd.Series(target.astype(np.float32), index=X.index)
         return X, y
 
@@ -72,6 +81,13 @@ class TestArrowstreetRegressor(unittest.TestCase):
         model = ArrowstreetRegressor(feature_cols=["feature_a", "feature_b", "feature_c"])
         with self.assertRaises(ValueError):
             model.fit(X_no_era, y)
+
+    def test_unknown_param_raises(self) -> None:
+        with self.assertRaises(ValueError):
+            ArrowstreetRegressor(
+                feature_cols=["feature_a", "feature_b", "feature_c"],
+                unknown_param=123,
+            )
 
     def test_deterministic_given_seed(self) -> None:
         X, y = self._make_data()
@@ -117,3 +133,108 @@ class TestArrowstreetRegressor(unittest.TestCase):
             any("X does not have valid feature names" in msg for msg in messages),
             "stage2 LightGBM predict emitted feature-name warnings",
         )
+
+    def test_stage2_weight_zero_matches_stage1_only(self) -> None:
+        X, y = self._make_data()
+        common_kwargs = dict(
+            feature_cols=["feature_a", "feature_b", "feature_c"],
+            basket_cluster_sizes=[4],
+            linkage_k=3,
+            random_state=7,
+            model_variant="residual_two_stage",
+            stage2_model_type="ridge",
+        )
+
+        weighted_zero = ArrowstreetRegressor(
+            **common_kwargs,
+            stage2_weight=0.0,
+        ).fit(X, y)
+        weighted_one = ArrowstreetRegressor(
+            **common_kwargs,
+            stage2_weight=1.0,
+        ).fit(X, y)
+        stage1_only = ArrowstreetRegressor(
+            feature_cols=["feature_a", "feature_b", "feature_c"],
+            basket_cluster_sizes=[4],
+            linkage_k=3,
+            random_state=7,
+            model_variant="standard",
+            use_linkages=False,
+        ).fit(X, y)
+
+        p_zero = weighted_zero.predict(X)
+        p_one = weighted_one.predict(X)
+        p_stage1 = stage1_only.predict(X)
+        self.assertTrue(np.allclose(p_zero, p_stage1, atol=1e-6))
+        self.assertFalse(np.allclose(p_zero, p_one))
+
+    def test_indirect_feature_selection_ranked_count(self) -> None:
+        X, y = self._make_data(n_eras=12, rows_per_era=16)
+        model = ArrowstreetRegressor(
+            feature_cols=["feature_a", "feature_b", "feature_c"],
+            basket_cluster_sizes=[4],
+            linkage_k=3,
+            random_state=7,
+            indirect_max_base_features=2,
+            indirect_feature_selection="era_corr_ranked",
+            indirect_feature_ranking_min_eras=2,
+        )
+        model.fit(X, y)
+        selected = model._indirect_base or []
+        self.assertEqual(len(selected), 2)
+        self.assertTrue(set(selected).issubset({"feature_a", "feature_b", "feature_c"}))
+
+    def test_embedding_mode_pca_smoke(self) -> None:
+        X, y = self._make_data()
+        model = ArrowstreetRegressor(
+            feature_cols=["feature_a", "feature_b", "feature_c"],
+            basket_cluster_sizes=[4],
+            linkage_k=3,
+            random_state=7,
+            embedding_mode="pca",
+            embedding_pca_components=2,
+        )
+        model.fit(X, y)
+        preds = model.predict(X)
+        self.assertEqual(preds.shape[0], X.shape[0])
+        self.assertTrue(np.isfinite(preds).all())
+
+    def test_stage2_target_mode_residual_to_benchmark_requires_column(self) -> None:
+        X, y = self._make_data()
+        model = ArrowstreetRegressor(
+            feature_cols=["feature_a", "feature_b", "feature_c"],
+            basket_cluster_sizes=[4],
+            linkage_k=3,
+            random_state=7,
+            model_variant="residual_two_stage",
+            stage2_model_type="ridge",
+            stage2_target_mode="residual_to_benchmark",
+        )
+        with self.assertRaises(ValueError):
+            model.fit(X, y)
+
+    def test_stage2_target_mode_residual_to_benchmark_smoke(self) -> None:
+        X, y = self._make_data(include_benchmark=True)
+        common_kwargs = dict(
+            feature_cols=["feature_a", "feature_b", "feature_c"],
+            basket_cluster_sizes=[4],
+            linkage_k=3,
+            random_state=7,
+            model_variant="residual_two_stage",
+            stage2_model_type="ridge",
+        )
+        base_model = ArrowstreetRegressor(
+            **common_kwargs,
+            stage2_target_mode="residual",
+        ).fit(X, y)
+        ortho_model = ArrowstreetRegressor(
+            **common_kwargs,
+            stage2_target_mode="residual_to_benchmark",
+            stage2_benchmark_col="v52_lgbm_ender20",
+            stage2_benchmark_beta=1.0,
+        ).fit(X, y)
+        p_base = base_model.predict(X)
+        p_ortho = ortho_model.predict(X)
+        self.assertEqual(p_base.shape[0], X.shape[0])
+        self.assertEqual(p_ortho.shape[0], X.shape[0])
+        self.assertFalse(np.allclose(p_base, p_ortho))

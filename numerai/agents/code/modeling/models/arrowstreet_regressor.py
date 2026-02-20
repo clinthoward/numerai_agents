@@ -50,12 +50,72 @@ class ArrowstreetRegressor:
         model_variant: str = "standard",
         stage2_model_type: str = "ridge",
         stage2_lgbm_params: dict[str, Any] | None = None,
+        stage2_weight: float = 1.0,
+        stage2_target_mode: str = "residual",
+        stage2_benchmark_col: str | None = None,
+        stage2_benchmark_beta: float = 1.0,
         dtype_float: str = "float32",
         random_state: int = 42,
         era_col: str = "era",
         group_sets: dict[str, list[str]] | None = None,
-        **_: Any,
+        indirect_feature_selection: str = "first_n",
+        indirect_feature_ranking_target: str = "target",
+        indirect_feature_ranking_min_eras: int = 40,
+        embedding_mode: str = "mean",
+        embedding_pca_components: int | None = None,
+        **kwargs: Any,
     ) -> None:
+        if kwargs:
+            unknown = ", ".join(sorted(kwargs.keys()))
+            raise ValueError(f"Unsupported ArrowstreetRegressor params: {unknown}")
+
+        self._model_variant = str(model_variant)
+        if self._model_variant not in {"standard", "residual_two_stage"}:
+            raise ValueError(
+                "ArrowstreetRegressor model_variant must be one of: "
+                "standard, residual_two_stage."
+            )
+        self._stage2_model_type = str(stage2_model_type).lower()
+        if self._stage2_model_type not in {"ridge", "lgbm"}:
+            raise ValueError(
+                "ArrowstreetRegressor stage2_model_type must be one of: ridge, lgbm."
+            )
+        self._stage2_target_mode = str(stage2_target_mode).lower()
+        if self._stage2_target_mode not in {"residual", "residual_to_benchmark"}:
+            raise ValueError(
+                "ArrowstreetRegressor stage2_target_mode must be one of: "
+                "residual, residual_to_benchmark."
+            )
+        self._stage2_benchmark_col = (
+            None if stage2_benchmark_col is None else str(stage2_benchmark_col)
+        )
+        self._stage2_benchmark_beta = float(stage2_benchmark_beta)
+        if not np.isfinite(self._stage2_benchmark_beta):
+            raise ValueError("ArrowstreetRegressor stage2_benchmark_beta must be finite.")
+
+        self._stage2_weight = float(stage2_weight)
+        if not np.isfinite(self._stage2_weight):
+            raise ValueError("ArrowstreetRegressor stage2_weight must be finite.")
+
+        self._indirect_feature_selection = str(indirect_feature_selection).lower()
+        if self._indirect_feature_selection not in {"first_n", "era_corr_ranked"}:
+            raise ValueError(
+                "ArrowstreetRegressor indirect_feature_selection must be one of: "
+                "first_n, era_corr_ranked."
+            )
+        self._indirect_feature_ranking_target = str(indirect_feature_ranking_target)
+        self._indirect_feature_ranking_min_eras = int(indirect_feature_ranking_min_eras)
+        self._embedding_mode = str(embedding_mode).lower()
+        if self._embedding_mode not in {"mean", "pca"}:
+            raise ValueError(
+                "ArrowstreetRegressor embedding_mode must be one of: mean, pca."
+            )
+        self._embedding_pca_components = (
+            None
+            if embedding_pca_components is None
+            else int(embedding_pca_components)
+        )
+
         self._feature_cols = feature_cols
         self._ridge_alpha = float(ridge_alpha)
         self._indirect_max_base_features = int(indirect_max_base_features)
@@ -64,8 +124,6 @@ class ArrowstreetRegressor:
         self._linkage_stats = linkage_stats or ["mean", "std", "min", "max"]
         self._use_baskets = bool(use_baskets)
         self._use_linkages = bool(use_linkages)
-        self._model_variant = model_variant
-        self._stage2_model_type = stage2_model_type
         self._stage2_lgbm_params = stage2_lgbm_params or {}
         self._dtype_float = dtype_float
         self._random_state = int(random_state)
@@ -79,6 +137,7 @@ class ArrowstreetRegressor:
         self._basket_builder: BasketBuilder | None = None
         self._linkage_builder: LinkageBuilder | None = None
         self._model: Any = None
+        self._resolved_stage2_benchmark_col: str | None = None
         self._fitted = False
 
     def fit(self, X, y, **kwargs):  # noqa: ANN001
@@ -87,13 +146,15 @@ class ArrowstreetRegressor:
         y_series = self._coerce_y(y, X_df.index)
 
         base_features = self._resolve_base_features(X_df)
-        indirect_base = base_features[: self._indirect_max_base_features]
+        indirect_base = self._select_indirect_base(X_df, y_series, base_features)
         group_sets = self._resolve_group_sets(base_features)
         basket_builder = BasketBuilder(
             group_sets=group_sets,
             cluster_sizes=list(self._basket_cluster_sizes),
             random_state=self._random_state,
             dtype_float=self._dtype_float,
+            embedding_mode=self._embedding_mode,
+            pca_components=self._embedding_pca_components,
         )
         # X_df already contains era + feature columns for this model path.
         basket_builder.fit(X_df)
@@ -124,7 +185,7 @@ class ArrowstreetRegressor:
             self._model = self._fit_standard(
                 X_df,
                 y_series,
-                use_linkages=True,
+                use_linkages=self._use_linkages,
             )
         self._fitted = True
         return self
@@ -164,7 +225,9 @@ class ArrowstreetRegressor:
                 self._linkage_feature_names or [],
             )
             pred2 = self._predict_model(model_stage2, standardize_block(X_stage2, self._dtype_float))
-            return (pred1 + pred2).astype(np.dtype(self._dtype_float), copy=False)
+            return (pred1 + self._stage2_weight * pred2).astype(
+                np.dtype(self._dtype_float), copy=False
+            )
 
         X_full = self._build_feature_block(
             block,
@@ -240,8 +303,57 @@ class ArrowstreetRegressor:
             )
 
         residual = y_series - stage1_preds.astype(y_series.dtype)
+        if self._stage2_target_mode == "residual_to_benchmark":
+            benchmark_series = self._resolve_stage2_benchmark_series(X_df)
+            benchmark_values = pd.to_numeric(
+                benchmark_series, errors="coerce"
+            ).fillna(0.0)
+            residual = residual - (
+                self._stage2_benchmark_beta
+                * benchmark_values.astype(y_series.dtype, copy=False)
+            )
         stage2 = self._fit_stage2_model(X_df, residual)
         return {"stage1": stage1, "stage2": stage2}
+
+    def _resolve_stage2_benchmark_series(self, X_df: pd.DataFrame) -> pd.Series:
+        assert self._base_features is not None
+
+        excluded = {self._era_col, *self._base_features}
+        candidate_cols = [col for col in X_df.columns if col not in excluded]
+        if not candidate_cols:
+            raise ValueError(
+                "ArrowstreetRegressor stage2_target_mode='residual_to_benchmark' "
+                "requires at least one benchmark-like column in X."
+            )
+
+        if self._stage2_benchmark_col is not None:
+            if self._stage2_benchmark_col not in X_df.columns:
+                raise ValueError(
+                    "ArrowstreetRegressor stage2_benchmark_col was not found in X: "
+                    f"{self._stage2_benchmark_col}"
+                )
+            benchmark_col = self._stage2_benchmark_col
+        elif "v52_lgbm_ender20" in candidate_cols:
+            benchmark_col = "v52_lgbm_ender20"
+        else:
+            v_candidates = sorted(col for col in candidate_cols if col.startswith("v"))
+            if len(v_candidates) == 1:
+                benchmark_col = v_candidates[0]
+            elif len(v_candidates) > 1:
+                raise ValueError(
+                    "ArrowstreetRegressor stage2_target_mode='residual_to_benchmark' "
+                    "found multiple benchmark candidates. Set stage2_benchmark_col."
+                )
+            elif len(candidate_cols) == 1:
+                benchmark_col = candidate_cols[0]
+            else:
+                raise ValueError(
+                    "ArrowstreetRegressor stage2_target_mode='residual_to_benchmark' "
+                    "could not infer benchmark column. Set stage2_benchmark_col."
+                )
+
+        self._resolved_stage2_benchmark_col = benchmark_col
+        return X_df[benchmark_col]
 
     def _fit_stage2_model(self, X_df: pd.DataFrame, residual: pd.Series):
         assert self._indirect_base is not None
@@ -279,6 +391,11 @@ class ArrowstreetRegressor:
             model = LGBMRegressor(**self._stage2_lgbm_params)
             model.fit(X_train, y_train)
             return model
+
+        if self._stage2_model_type != "ridge":
+            raise ValueError(
+                "ArrowstreetRegressor stage2_model_type must be one of: ridge, lgbm."
+            )
 
         model = StreamingRidge(
             n_features=len(self._linkage_feature_names),
@@ -332,26 +449,36 @@ class ArrowstreetRegressor:
             )
             return np.zeros((0, width), dtype=dtype)
 
-        emb_block = self._basket_builder.transform_embeddings(df_block)
-        basket_assign = self._basket_builder.assign_baskets(emb_block)
-
-        basket_feats = self._basket_builder.compute_basket_features(
-            df=df_block,
-            basket_df=basket_assign,
-            base_cols=indirect_base,
-            era_col=self._era_col,
-        ).reindex(columns=basket_feature_names, fill_value=0.0)
-
-        linkage_feats = self._linkage_builder.compute_linkage_features(
-            df=df_block,
-            emb_df=emb_block,
-            base_cols=indirect_base,
-            era_col=self._era_col,
-        ).reindex(columns=linkage_feature_names, fill_value=0.0)
-
         base_values = df_block[base_features].to_numpy(dtype=dtype, copy=False)
-        basket_values = basket_feats.to_numpy(dtype=dtype, copy=False)
-        linkage_values = linkage_feats.to_numpy(dtype=dtype, copy=False)
+        need_baskets = bool(basket_feature_names)
+        need_linkages = bool(linkage_feature_names)
+        if not need_baskets and not need_linkages:
+            return base_values.astype(dtype, copy=False)
+
+        emb_block = self._basket_builder.transform_embeddings(df_block)
+        n_rows = len(df_block)
+        basket_values = np.zeros((n_rows, 0), dtype=dtype)
+        linkage_values = np.zeros((n_rows, 0), dtype=dtype)
+
+        if need_baskets:
+            basket_assign = self._basket_builder.assign_baskets(emb_block)
+            basket_feats = self._basket_builder.compute_basket_features(
+                df=df_block,
+                basket_df=basket_assign,
+                base_cols=indirect_base,
+                era_col=self._era_col,
+            ).reindex(columns=basket_feature_names, fill_value=0.0)
+            basket_values = basket_feats.to_numpy(dtype=dtype, copy=False)
+
+        if need_linkages:
+            linkage_feats = self._linkage_builder.compute_linkage_features(
+                df=df_block,
+                emb_df=emb_block,
+                base_cols=indirect_base,
+                era_col=self._era_col,
+            ).reindex(columns=linkage_feature_names, fill_value=0.0)
+            linkage_values = linkage_feats.to_numpy(dtype=dtype, copy=False)
+
         return np.column_stack([base_values, basket_values, linkage_values]).astype(
             dtype, copy=False
         )
@@ -377,6 +504,82 @@ class ArrowstreetRegressor:
         if self._group_sets:
             return {k: list(v) for k, v in self._group_sets.items()}
         return _partition_groups(base_features, n_groups=6)
+
+    def _select_indirect_base(
+        self,
+        X_df: pd.DataFrame,
+        y_series: pd.Series,
+        base_features: list[str],
+    ) -> list[str]:
+        limit = min(max(int(self._indirect_max_base_features), 0), len(base_features))
+        if limit <= 0:
+            return []
+        if self._indirect_feature_selection == "first_n":
+            return base_features[:limit]
+        ranked = self._rank_indirect_features(X_df, y_series, base_features)
+        if not ranked:
+            return base_features[:limit]
+        return ranked[:limit]
+
+    def _rank_indirect_features(
+        self,
+        X_df: pd.DataFrame,
+        y_series: pd.Series,
+        base_features: list[str],
+    ) -> list[str]:
+        n_features = len(base_features)
+        if n_features == 0:
+            return []
+
+        min_eras = max(1, int(self._indirect_feature_ranking_min_eras))
+        sum_corr = np.zeros(n_features, dtype=np.float64)
+        sumsq_corr = np.zeros(n_features, dtype=np.float64)
+        counts = np.zeros(n_features, dtype=np.int32)
+
+        grouped_indices = X_df.groupby(self._era_col, sort=False).indices
+        for positions in grouped_indices.values():
+            if len(positions) < 2:
+                continue
+            X_block = X_df.iloc[positions][base_features].to_numpy(
+                dtype=np.float64, copy=False
+            )
+            y_block = y_series.iloc[positions].to_numpy(dtype=np.float64, copy=False)
+            y_centered = y_block - y_block.mean()
+            y_std = y_centered.std()
+            if y_std < 1e-12:
+                continue
+
+            X_centered = X_block - X_block.mean(axis=0)
+            X_std = X_centered.std(axis=0)
+            valid = X_std > 1e-12
+            if not np.any(valid):
+                continue
+
+            corr = (X_centered[:, valid] * y_centered[:, None]).mean(axis=0) / (
+                X_std[valid] * y_std
+            )
+            corr = np.clip(corr, -1.0, 1.0)
+            sum_corr[valid] += corr
+            sumsq_corr[valid] += corr * corr
+            counts[valid] += 1
+
+        usable = counts >= min_eras
+        if not np.any(usable):
+            return []
+
+        means = np.zeros(n_features, dtype=np.float64)
+        stds = np.ones(n_features, dtype=np.float64)
+        means[usable] = sum_corr[usable] / counts[usable]
+        variances = np.maximum(
+            0.0,
+            (sumsq_corr[usable] / counts[usable]) - (means[usable] * means[usable]),
+        )
+        stds[usable] = np.sqrt(variances)
+
+        scores = np.full(n_features, -np.inf, dtype=np.float64)
+        scores[usable] = np.abs(means[usable]) / (1.0 + stds[usable])
+        order = np.argsort(-scores, kind="mergesort")
+        return [base_features[i] for i in order if np.isfinite(scores[i])]
 
     def _build_basket_feature_names(
         self,

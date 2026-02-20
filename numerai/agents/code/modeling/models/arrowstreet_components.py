@@ -8,6 +8,7 @@ import pandas as pd
 
 try:
     from sklearn.cluster import KMeans
+    from sklearn.decomposition import PCA
     from sklearn.neighbors import NearestNeighbors
     from sklearn.preprocessing import StandardScaler
 except ImportError as exc:  # pragma: no cover
@@ -38,8 +39,9 @@ class StreamingRidge:
         self.n_features = int(n_features)
         self.alpha = float(alpha)
         self.dtype = _as_dtype(dtype_float)
-        self.xtx = np.zeros((self.n_features, self.n_features), dtype=self.dtype)
-        self.xty = np.zeros(self.n_features, dtype=self.dtype)
+        self._acc_dtype = np.dtype("float64")
+        self.xtx = np.zeros((self.n_features, self.n_features), dtype=self._acc_dtype)
+        self.xty = np.zeros(self.n_features, dtype=self._acc_dtype)
         self.coef_: np.ndarray | None = None
         self.intercept_: float = 0.0
         self.fitted: bool = False
@@ -47,16 +49,17 @@ class StreamingRidge:
     def update(self, X: np.ndarray, y: np.ndarray) -> None:
         if X.size == 0:
             return
-        X_block = np.asarray(X, dtype=self.dtype)
-        y_block = np.asarray(y, dtype=self.dtype)
+        X_block = np.asarray(X, dtype=self._acc_dtype)
+        y_block = np.asarray(y, dtype=self._acc_dtype)
         if X_block.shape[0] != y_block.shape[0]:
             raise ValueError("X and y must contain the same number of rows.")
         self.xtx += X_block.T @ X_block
         self.xty += X_block.T @ y_block
 
     def finalize(self) -> None:
-        eye = np.eye(self.n_features, dtype=self.dtype)
-        self.coef_ = np.linalg.solve(self.xtx + self.alpha * eye, self.xty)
+        eye = np.eye(self.n_features, dtype=self._acc_dtype)
+        coef = np.linalg.solve(self.xtx + self.alpha * eye, self.xty)
+        self.coef_ = coef.astype(self.dtype, copy=False)
         self.intercept_ = 0.0
         self.fitted = True
 
@@ -69,7 +72,8 @@ class StreamingRidge:
                 f"StreamingRidge expected 2D array with {self.coef_.shape[0]} features, "
                 f"got shape {X_block.shape}."
             )
-        return X_block @ self.coef_ + self.intercept_
+        preds = X_block @ self.coef_ + self.intercept_
+        return np.asarray(preds, dtype=self.dtype, copy=False)
 
 
 @dataclass
@@ -80,16 +84,22 @@ class BasketBuilder:
     cluster_sizes: List[int] = field(default_factory=lambda: [16])
     random_state: int = 42
     dtype_float: str = "float32"
+    embedding_mode: str = "mean"
+    pca_components: int | None = None
 
     scaler: StandardScaler | None = field(init=False, default=None)
     clusterers: Dict[str, KMeans] = field(init=False, default_factory=dict)
     embedding_cols: List[str] = field(init=False, default_factory=list)
+    _raw_embedding_cols: List[str] = field(init=False, default_factory=list)
+    _pca: PCA | None = field(init=False, default=None)
     _emb_train: pd.DataFrame | None = field(init=False, default=None)
 
     def fit(self, df_train: pd.DataFrame) -> None:
-        emb_df = self._compute_group_means(df_train)
-        if emb_df.empty:
+        raw_emb_df = self._compute_group_means(df_train)
+        if raw_emb_df.empty:
             raise ValueError("Failed to build embeddings: no valid group features found.")
+        self._raw_embedding_cols = list(raw_emb_df.columns)
+        emb_df = self._project_embeddings(raw_emb_df, fit=True)
         dtype = _as_dtype(self.dtype_float)
         emb_values = emb_df.to_numpy(dtype=dtype, copy=False)
         self.scaler = StandardScaler().fit(emb_values)
@@ -103,11 +113,12 @@ class BasketBuilder:
     def transform_embeddings(self, df: pd.DataFrame) -> pd.DataFrame:
         if self.scaler is None or not self.embedding_cols:
             raise RuntimeError("BasketBuilder must be fitted before transform.")
-        emb_df = self._compute_group_means(df)
-        for col in self.embedding_cols:
-            if col not in emb_df.columns:
-                emb_df[col] = 0.0
-        emb_df = emb_df[self.embedding_cols]
+        raw_emb_df = self._compute_group_means(df)
+        for col in self._raw_embedding_cols:
+            if col not in raw_emb_df.columns:
+                raw_emb_df[col] = 0.0
+        raw_emb_df = raw_emb_df[self._raw_embedding_cols]
+        emb_df = self._project_embeddings(raw_emb_df, fit=False)
         emb_values = emb_df.to_numpy(dtype=_as_dtype(self.dtype_float), copy=False)
         emb_scaled = self.scaler.transform(emb_values).astype(
             _as_dtype(self.dtype_float), copy=False
@@ -166,6 +177,39 @@ class BasketBuilder:
                 df[present].astype(dtype).mean(axis=1).astype(dtype)
             )
         return emb_df
+
+    def _project_embeddings(self, raw_emb_df: pd.DataFrame, *, fit: bool) -> pd.DataFrame:
+        dtype = _as_dtype(self.dtype_float)
+        mode = str(self.embedding_mode).lower()
+
+        if mode == "mean":
+            if fit:
+                self._pca = None
+            return raw_emb_df.astype(dtype, copy=False)
+
+        if mode != "pca":
+            raise ValueError(f"Unsupported embedding_mode: {self.embedding_mode}")
+
+        raw_values = raw_emb_df.to_numpy(dtype=dtype, copy=False)
+        if fit:
+            n_rows, n_cols = raw_values.shape
+            max_components = min(n_rows, n_cols)
+            if max_components < 1:
+                raise ValueError("PCA embedding requires at least one row and one column.")
+            if self.pca_components is None:
+                n_components = min(8, max_components)
+            else:
+                n_components = max(1, min(int(self.pca_components), max_components))
+            self._pca = PCA(n_components=n_components, random_state=self.random_state)
+            projected = self._pca.fit_transform(raw_values).astype(dtype, copy=False)
+            cols = [f"emb_pca_{i}" for i in range(projected.shape[1])]
+            return pd.DataFrame(projected, index=raw_emb_df.index, columns=cols)
+
+        if self._pca is None:
+            raise RuntimeError("BasketBuilder PCA must be fitted before transform.")
+        projected = self._pca.transform(raw_values).astype(dtype, copy=False)
+        cols = [f"emb_pca_{i}" for i in range(projected.shape[1])]
+        return pd.DataFrame(projected, index=raw_emb_df.index, columns=cols)
 
     def _fit_clusterers(self) -> None:
         if self._emb_train is None:
